@@ -49,5 +49,5 @@ class SlackAPIPostOperator(SlackAPIOperator):
 
 class SlackAPIPostOperatorHatiware(SlackAPIPostOperator):
     def __init__(self, **kwargs):
-        self.token = Variable.get("slack_token")
+        self.token = Variable.get("slack_token_hatiware")
         super().__init__(token=self.token, **kwargs)

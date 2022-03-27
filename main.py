@@ -1,15 +1,16 @@
-from google.cloud import bigquery
-from google.oauth2 import service_account
-import json
+import uuid
+import os
 from datetime import timedelta
-from airflow import DAG, settings
-from airflow.models import Connection
-from airflow.operators.python_operator import PythonOperator
-from airflow_dag_sample.operators.slack_api_post_operator import SlackAPIPostOperatorHatiware
-from airflow_dag_sample.operators.bigquery_get_data_operator import BigQueryGetDataOperator
+from operator import itemgetter
+from airflow import DAG
+from airflow.models import Variable
+from airflow.macros import ds_add
 from airflow.utils.dates import days_ago
-
-
+from airflow.utils.task_group import TaskGroup
+from airflow.operators.python_operator import PythonOperator
+from airflow_dag_sample.operators.slack_api_post_operator\
+    import SlackAPIPostOperatorHatiware
+from airflow_dag_sample.operators.bigquery_operator import BigQueryOperator
 
 
 default_args = {
@@ -17,59 +18,142 @@ default_args = {
     'depends_on_past': False,
     'start_date': days_ago(2),
 }
-dag = DAG(
+
+
+def get_extract_date(ti):
+    return ti.xcom_pull(task_ids='prepare', key='extract_date')
+
+
+def get_delete_date(ti):
+    return ti.xcom_pull(task_ids='prepare', key='delete_date')
+
+
+def _macros():
+    return {
+        'dataset': Variable.get('cost_dataset'),
+        'extract_date': get_extract_date,
+        'delete_date': get_delete_date,
+    }
+
+
+with DAG(
     'test_slack',
     default_args=default_args,
-    description='For TEST execute DAG',
+    description='日々のGCP使用料をSlackに通知するDAG',
     schedule_interval=timedelta(days=1),
-    tags=["work"]
-)
+    tags=["work"],
+    user_defined_macros=_macros(),
+) as dag:
+    dag.doc_md = """\
+    ## GCPの使用料金をSlackに通知するDAG
+    ### 使用するVariable
+    - bigquery_sa_keypath
+    - slack_token_hatiware
+    - cost_dataset
+    """
 
-def big_query(ti,**kwargs):
-    key_path = '/var/local/google_cloud_default.json'
-    credentials = service_account.Credentials.from_service_account_file(
-        key_path,
-        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    def prepare(**kwargs):
+        if kwargs['dag_run'].external_trigger \
+             and not kwargs['dag_run'].is_backfill:
+            extract_date = kwargs['yesterday_ds']
+            delete_date = ds_add(kwargs['yesterday_ds'], -5)
+        else:
+            extract_date = kwargs['ds']
+            delete_date = ds_add(kwargs['ds'], -5)
+        kwargs['ti'].xcom_push(key='extract_date', value=extract_date)
+        kwargs['ti'].xcom_push(key='delete_date', value=delete_date)
+        local_log_dir = '/var/log/bigquery/'
+        suffix = str(uuid.uuid4()).replace('-', '_')
+        kwargs['ti'].xcom_push(
+            key='local_log_filepath',
+            value=f'{local_log_dir}{extract_date}_{suffix}.csv')
+
+    prepare_task = PythonOperator(
+        task_id="prepare",
+        python_callable=prepare,
     )
 
-    query = (
-        "SELECT cast(export_time as date) AS t1 ,project.name,service.description,sum(cost) AS t2 \
-        FROM `annular-surf-336608.dataset.gcp_billing_export_v1_01D2A8_A178BF_6CF5C8` \
-        WHERE cast(export_time as date) = DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 DAY) \
-        group by cast(export_time as date),project.name,service.description;")
+    with TaskGroup(
+         "main_task_group", tooltip="bqからextract_dateのgcp利用料金を抽出・加工し、Slackに送る"
+         ) as main_group:
+        def reader(filepath: str) -> list:
+            with open(filepath) as f:
+                for row in f:
+                    yield row.split(',')
 
-    #client = bigquery.Client()
-    client = bigquery.Client(
-        credentials=credentials,
-        project=credentials.project_id,
-    )
-    query_job = client.query(query)
-    rows = query_job.result()
-    total_cost=0
-    text=f"昨日のGCP使用料金"
-    print(rows)
-    for row in rows:
-        total_cost += int(row.t2)
-        text=text+f"\n{row.name}.{row.description}   ¥{row.t2}"
-    if total_cost > 1000:
-        text=text+"\n\nお買い物検定3級"
-    else:
-        text=text+"\n\nお買い物検定2級"
-    return text
+        def check_total(total_cost: str) -> str:
+            if total_cost > 100:
+                return "お買い物検定3級"
+            else:
+                return "お買い物検定2級"
 
-big_query = PythonOperator(
-    dag=dag,
-    provide_context=True, 
-    task_id='big_query',
-    python_callable=big_query,
-)
+        def create_text(extract_date: str, result_dict: dict) -> str:
+            text = f"{extract_date}のGCP使用料金"
+            total_cost = 0
+            for project, values in result_dict.items():
+                text = text+f"\n{project}----"
+                for value in sorted(
+                        values, key=itemgetter('cost'), reverse=True):
+                    cost = int(float(value['cost']))
+                    text = text+f"\n・{value['service']} ¥{cost}"
+                    total_cost += cost
+            text = text+f"\n\n{check_total(total_cost)}"
+            return text
 
-slack = SlackAPIPostOperatorHatiware(
-    task_id="post_hello",
-    text="{{ ti.xcom_pull('big_query')}}",
-    dag=dag,
-    channel="costs"
-)
+        def transform(**kwargs):
+            filepath = kwargs['ti'].xcom_pull(key='local_log_filepath')
+            result_dict = {}
+            for row in reader(filepath):
+                if result_dict.get(row[0], None) is not None:
+                    result_dict[row[0]] = \
+                        list(result_dict[row[0]])\
+                        + [dict(service=row[1], cost=row[2])]
+                else:
+                    result_dict[row[0]] = \
+                        [dict(service=row[1], cost=row[2])]
+            kwargs['ti'].xcom_push(
+                key='slack_text',
+                value=create_text(kwargs['extract_date'], result_dict))
 
+        extract_task = BigQueryOperator(
+            task_id='extract',
+            sql='sql/extract_cost.sql',
+            filepath="{{ ti.xcom_pull(key='local_log_filepath') }}",
+            do_xcom_push=False,
+        )
 
-big_query >> slack
+        transform_task = PythonOperator(
+            task_id="transform",
+            op_kwargs={"extract_date": '{{ extract_date(ti) }}'},
+            python_callable=transform,
+        )
+
+        slack_notify_task = SlackAPIPostOperatorHatiware(
+            task_id="slack_notify",
+            text="{{ ti.xcom_pull(key='slack_text')}}",
+            channel="costs"
+        )
+
+        extract_task >> transform_task >> slack_notify_task
+
+    with TaskGroup(
+         "clean_group", tooltip="bqデータの整理&&ローカルファイルの整理") as clean_group:
+        def clean_local(**kwargs):
+            os.remove(kwargs['ti'].xcom_pull(
+                task_ids='prepare', key='local_log_filepath'))
+
+        clean_local_task = PythonOperator(
+            task_id="clean_local",
+            python_callable=clean_local,
+        )
+
+        clean_bq_task = BigQueryOperator(
+            task_id='clean_bq',
+            sql="DELETE FROM {{ dataset }} \
+                 WHERE cast(export_time as date) <= '{{ delete_date(ti) }}'",
+            do_xcom_push=False,
+        )
+
+        clean_local_task >> clean_bq_task
+
+    prepare_task >> main_group >> clean_group
