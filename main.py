@@ -14,7 +14,7 @@ from airflow_dag_sample.operators.bigquery_operator import BigQueryOperator
 
 
 default_args = {
-    'owner': 'shimoyama',
+    'owner': 'srn221B',
     'depends_on_past': False,
     'start_date': days_ago(2),
 }
@@ -137,15 +137,7 @@ with DAG(
         extract_task >> transform_task >> slack_notify_task
 
     with TaskGroup(
-         "clean_group", tooltip="bqデータの整理&&ローカルファイルの整理") as clean_group:
-        def clean_local(**kwargs):
-            os.remove(kwargs['ti'].xcom_pull(
-                task_ids='prepare', key='local_log_filepath'))
-
-        clean_local_task = PythonOperator(
-            task_id="clean_local",
-            python_callable=clean_local,
-        )
+         "clean_group", tooltip="bqデータの整理") as clean_group:
 
         clean_bq_task = BigQueryOperator(
             task_id='clean_bq',
@@ -154,6 +146,6 @@ with DAG(
             do_xcom_push=False,
         )
 
-        clean_local_task >> clean_bq_task
+        clean_bq_task
 
     prepare_task >> main_group >> clean_group
