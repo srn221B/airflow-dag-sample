@@ -30,7 +30,7 @@ def get_delete_date(ti):
 
 def _macros():
     return {
-        'dataset': Variable.get('cost_dataset'),
+        'bq_table': f"{Variable.get('cost_dataset')}.dataset.{Variable.get('cost_table')}",
         'extract_date': get_extract_date,
         'delete_date': get_delete_date,
     }
@@ -50,6 +50,7 @@ with DAG(
     - bigquery_sa_keypath
     - slack_token_hatiware
     - cost_dataset
+    - cost_table
     """
 
     def prepare(**kwargs):
@@ -141,7 +142,7 @@ with DAG(
 
         clean_bq_task = BigQueryOperator(
             task_id='clean_bq',
-            sql="DELETE FROM {{ dataset }} \
+            sql="DELETE FROM {{ bq_table }} \
                  WHERE cast(export_time as date) <= '{{ delete_date(ti) }}'",
             do_xcom_push=False,
         )
