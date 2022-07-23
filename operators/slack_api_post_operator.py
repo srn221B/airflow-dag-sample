@@ -1,6 +1,7 @@
 import json
 from airflow.models import Variable
 from airflow.operators.slack_operator import SlackAPIOperator
+from airflow.utils.decorators import apply_defaults
 from typing import Any, List, Optional, Sequence
 
 
@@ -15,6 +16,7 @@ class SlackAPIPostOperator(SlackAPIOperator):
 
     ui_color = '#b6f0dd'
 
+    @apply_defaults
     def __init__(
         self,
         channel: str = '#general',
